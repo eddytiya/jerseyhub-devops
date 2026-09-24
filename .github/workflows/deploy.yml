@@ -1,0 +1,85 @@
+name: JerseyHub CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jerseyhub-production
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Build backend image
+        run: docker build -t jerseyhub-backend:ci ./backend
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            --build-arg VITE_API_URL=/api \
+            --build-arg VITE_RAZORPAY_ENABLED=false \
+            -t jerseyhub-frontend:ci \
+            ./frontend
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+
+    env:
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+
+    steps:
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/jerseyhub_ec2
+          sed -i 's/\r$//' ~/.ssh/jerseyhub_ec2
+          chmod 600 ~/.ssh/jerseyhub_ec2
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy application
+        run: |
+          ssh \
+            -i ~/.ssh/jerseyhub_ec2 \
+            -o BatchMode=yes \
+            "$EC2_USER@$EC2_HOST" 'bash -se' <<'REMOTE'
+          set -Eeuo pipefail
+
+          cd /home/ubuntu/jerseyhub-devops
+
+          git pull --ff-only origin main
+          docker compose up -d --build --remove-orphans
+
+          sleep 15
+
+          docker compose ps
+          curl --fail --silent --show-error \
+            https://jerseyhub-devops.duckdns.org/api/
+          REMOTE
+
+      - name: Verify public HTTPS deployment
+        run: |
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 5 \
+            https://jerseyhub-devops.duckdns.org/api/
