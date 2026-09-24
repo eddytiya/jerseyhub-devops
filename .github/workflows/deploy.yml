@@ -15,12 +15,27 @@ concurrency:
 
 jobs:
   build:
-    name: Build and validate
+    name: Test, build and validate
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+
+      - name: Run backend integration tests
+        run: |
+          docker run --rm \
+            -v "$PWD/backend:/source:ro" \
+            -w /tmp/backend \
+            node:24-bookworm-slim \
+            sh -c '
+              apt-get update >/dev/null &&
+              apt-get install -y --no-install-recommends libcurl4 ca-certificates >/dev/null &&
+              cp -a /source/. . &&
+              rm -f .env &&
+              npm ci &&
+              npm test
+            '
 
       - name: Build backend image
         run: docker build -t jerseyhub-backend:ci ./backend
@@ -54,24 +69,117 @@ jobs:
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Deploy application
+      - name: Deploy with health verification and rollback
         run: |
           ssh \
             -i ~/.ssh/jerseyhub_ec2 \
             -o BatchMode=yes \
-            "$EC2_USER@$EC2_HOST" 'bash -se' <<'REMOTE'
+            "$EC2_USER@$EC2_HOST" \
+            'bash -se' -- "$GITHUB_SHA" <<'REMOTE'
           set -Eeuo pipefail
 
-          cd /home/ubuntu/jerseyhub-devops
+          APP_DIR=/home/ubuntu/jerseyhub-devops
+          DEPLOY_SHA="$1"
 
-          git pull --ff-only origin main
-          docker compose up -d --build --remove-orphans
+          cd "$APP_DIR"
 
-          sleep 15
+          PREVIOUS_SHA="$(git rev-parse HEAD)"
+          echo "Previous deployment: $PREVIOUS_SHA"
+          echo "Requested deployment: $DEPLOY_SHA"
 
+          wait_for_health() {
+            attempt=1
+
+            while [ "$attempt" -le 36 ]; do
+              all_healthy=true
+
+              for service in backend frontend caddy; do
+                container_id="$(docker compose ps -q "$service")"
+
+                if [ -z "$container_id" ]; then
+                  state=missing
+                else
+                  state="$(
+                    docker inspect \
+                      --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+                      "$container_id" 2>/dev/null || true
+                  )"
+                fi
+
+                echo "Attempt $attempt: $service=$state"
+
+                if [ "$state" != "healthy" ]; then
+                  all_healthy=false
+                fi
+              done
+
+              if [ "$all_healthy" = true ]; then
+                return 0
+              fi
+
+              sleep 5
+              attempt=$((attempt + 1))
+            done
+
+            return 1
+          }
+
+          rollback() {
+            echo "Deployment failed. Rolling back to $PREVIOUS_SHA"
+
+            git checkout --detach "$PREVIOUS_SHA"
+            docker compose up -d --build --remove-orphans
+
+            echo "Rollback containers:"
+            docker compose ps
+          }
+
+          git fetch origin main
+          git checkout --detach "$DEPLOY_SHA"
+
+          if ! docker compose up -d --build --remove-orphans; then
+            rollback
+            exit 1
+          fi
+
+          if ! wait_for_health; then
+            echo "One or more containers failed their health checks."
+            docker compose ps
+            docker compose logs --tail 100
+            rollback
+            exit 1
+          fi
+
+          if ! curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 5 \
+            https://jerseyhub-devops.duckdns.org/api/; then
+            echo "Public API verification failed."
+            rollback
+            exit 1
+          fi
+
+          if ! curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 5 \
+            --output /dev/null \
+            https://jerseyhub-devops.duckdns.org/; then
+            echo "Public frontend verification failed."
+            rollback
+            exit 1
+          fi
+
+          git checkout main
+          git merge --ff-only "$DEPLOY_SHA"
+
+          echo "Deployment completed successfully."
           docker compose ps
-          curl --fail --silent --show-error \
-            https://jerseyhub-devops.duckdns.org/api/
           REMOTE
 
       - name: Verify public HTTPS deployment
@@ -83,3 +191,12 @@ jobs:
             --retry 5 \
             --retry-delay 5 \
             https://jerseyhub-devops.duckdns.org/api/
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-delay 5 \
+            --output /dev/null \
+            https://jerseyhub-devops.duckdns.org/
