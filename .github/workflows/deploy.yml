@@ -83,7 +83,13 @@ jobs:
 
           cd "$APP_DIR"
 
-          PREVIOUS_SHA="$(git rev-parse HEAD)"
+          STATE_FILE="$HOME/.jerseyhub-last-successful-sha"
+
+          if [ -s "$STATE_FILE" ] && git cat-file -e "$(cat "$STATE_FILE")^{commit}" 2>/dev/null; then
+            PREVIOUS_SHA="$(cat "$STATE_FILE")"
+          else
+            PREVIOUS_SHA="$(git rev-parse "${DEPLOY_SHA}^")"
+          fi
           echo "Previous deployment: $PREVIOUS_SHA"
           echo "Requested deployment: $DEPLOY_SHA"
 
@@ -177,6 +183,7 @@ jobs:
 
           git checkout main
           git merge --ff-only "$DEPLOY_SHA"
+          printf '%s\n' "$DEPLOY_SHA" > "$STATE_FILE"
 
           echo "Deployment completed successfully."
           docker compose ps
