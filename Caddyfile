@@ -1,0 +1,3 @@
+jerseyhub-devops.duckdns.org {
+    reverse_proxy frontend:80
+}
